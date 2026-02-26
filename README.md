@@ -137,19 +137,95 @@ If the channel uses a non-default PSK, the firmware can optionally hold the chan
 
 ---
 
+## Repository Layout
+
+```
+ESPHome-Meshtastic-MQTT/
+│
+├── meshtastic_gw.yaml              # Main ESPHome configuration — edit this
+├── secrets.yaml.example            # Template for credentials (copy → secrets.yaml)
+│
+├── components/
+│   └── meshtastic_ble/             # ESPHome custom component
+│       ├── __init__.py             # Component schema & code-gen (Python)
+│       ├── meshtastic_ble.h        # C++ class declaration
+│       ├── meshtastic_ble.cpp      # C++ implementation
+│       ├── gatt_defs.h             # GATT UUIDs, topic suffixes, constants
+│       │
+│       ├── proto/                  # nanopb-generated sources (run gen_proto.sh)
+│       │   └── meshtastic/
+│       │       ├── mesh.pb.h / .c
+│       │       ├── telemetry.pb.h / .c
+│       │       ├── config.pb.h / .c
+│       │       └── ...
+│       │
+│       └── nanopb/                 # nanopb runtime (copied by gen_proto.sh)
+│           ├── pb.h
+│           ├── pb_decode.h / .c
+│           └── pb_encode.h / .c
+│
+└── scripts/
+    └── gen_proto.sh                # Fetch Meshtastic .proto files & run nanopb
+```
+
+---
+
 ## Getting Started
 
-> Full configuration examples and the custom component source will be added as the project matures. The steps below outline the intended workflow.
+### 1. Prerequisites
 
-1. **Clone this repo** into your ESPHome config directory or alongside it.
+| Tool | Version | Notes |
+|------|---------|-------|
+| ESPHome | ≥ 2024.6 | `pip install esphome` or HA add-on |
+| Python | ≥ 3.10 | For ESPHome CLI and proto generation |
+| protoc | any recent | `apt install protobuf-compiler` / `brew install protobuf` |
+| nanopb | ≥ 0.4.8 | `pip install nanopb` |
 
-2. **Copy the example config** and fill in your WiFi credentials, MQTT broker details, and the BLE name or MAC of your Meshtastic node.
+### 2. Clone and configure
 
-3. **Flash** the firmware to your ESP32 via USB (`esphome run <config>.yaml`) or OTA.
+```bash
+git clone https://github.com/<you>/ESPHome-Meshtastic-MQTT.git
+cd ESPHome-Meshtastic-MQTT
 
-4. **Watch the logs** — the ESP32 will scan for your node, connect, run the config handshake, and begin publishing telemetry to MQTT.
+cp secrets.yaml.example secrets.yaml
+# Edit secrets.yaml — fill in WiFi, MQTT broker, and Meshtastic node name
+```
 
-5. **Add entities in Home Assistant** — MQTT discovery publishes device and entity configs automatically.
+### 3. Generate protobuf sources
+
+This only needs to be run once (and again after a Meshtastic firmware update):
+
+```bash
+./scripts/gen_proto.sh
+# Optionally pin a version:
+# MESHTASTIC_PROTO_VERSION=v2.5 ./scripts/gen_proto.sh
+```
+
+The script fetches `.proto` files from the [Meshtastic protobufs repo](https://github.com/meshtastic/protobufs), runs the nanopb generator, and places the output under `components/meshtastic_ble/proto/` and `components/meshtastic_ble/nanopb/`.
+
+### 4. Flash
+
+```bash
+esphome run meshtastic_gw.yaml
+```
+
+For subsequent updates over WiFi:
+
+```bash
+esphome upload meshtastic_gw.yaml
+```
+
+### 5. Watch the logs
+
+```bash
+esphome logs meshtastic_gw.yaml
+```
+
+The ESP32 will scan for your Meshtastic node, connect over BLE, run the `WantConfig` handshake to sync the node database, then enter the `READY` state. After that, packets appear on MQTT immediately.
+
+### 6. Home Assistant
+
+MQTT discovery payloads are published automatically. In Home Assistant go to **Settings → Devices & Services → MQTT** and the gateway device should appear. Individual sensors (battery, position, messages) are mapped to entities.
 
 ---
 
