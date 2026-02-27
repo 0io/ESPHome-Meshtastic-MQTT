@@ -23,13 +23,23 @@
  */
 
 // ── Service ───────────────────────────────────────────────────────────────────
-// 128-bit UUIDs — verify against firmware source before flashing.
-#define MESHTASTIC_SERVICE_UUID     "6ba4b910-bes2-b8aa-cf0e-2ede84ca374e"
+// 128-bit UUIDs for firmware ≥ 2.x.
+// Source: meshtastic/firmware NimbleBluetooth.cpp + meshtastic-python BLEInterface
+// Verified against: https://python.meshtastic.org/ble_interface.html
+//                   https://meshtastic.org/docs/development/device/client-api/
+#define MESHTASTIC_SERVICE_UUID     "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
 
 // ── Characteristics ───────────────────────────────────────────────────────────
+// toRadio  — write  — client sends ToRadio protobufs here
 #define MESHTASTIC_TORADIO_UUID     "f75c76d2-129e-4dad-a1dd-7866124401e7"
-#define MESHTASTIC_FROMRADIO_UUID   "8ba2bcc2-ee02-4a55-a531-c525c5e454d5"
-#define MESHTASTIC_FROMNUM_UUID     "ed9da18c-a800-4f66-a670-aa7547255902"
+// fromRadio — read  — read one FromRadio per call; loop until 0 bytes returned
+//   NOTE: old v1 UUID was "8ba2bcc2-ee02-4a55-a531-c525c5e454d5" (firmware 1.x)
+//   Current firmware (2.x+) uses the UUID below.
+#define MESHTASTIC_FROMRADIO_UUID   "2c55e69e-4993-11ed-b878-0242ac120002"
+// fromNum — read,notify — counter; subscribe for notifications to know when to read fromRadio
+#define MESHTASTIC_FROMNUM_UUID     "ed9da18c-a800-4f66-a670-aa7547e34453"
+// logRecord — notify (optional) — LogRecord protobufs for debug logging
+#define MESHTASTIC_LOGRECORD_UUID   "5a3d6e49-06e6-4423-9944-e9de8cdf9547"
 
 // ── Packet constraints ────────────────────────────────────────────────────────
 // BLE ATT MTU after negotiation is typically 512 bytes on esp-idf.
