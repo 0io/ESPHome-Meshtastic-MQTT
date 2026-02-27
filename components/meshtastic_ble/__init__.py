@@ -49,6 +49,9 @@ def validate(config):
     return config
 
 
+CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, validate)
+
+
 # ── Code generation ───────────────────────────────────────────────────────────
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])

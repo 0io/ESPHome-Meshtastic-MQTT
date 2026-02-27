@@ -41,9 +41,16 @@ void MeshtasticBLEComponent::loop() {
             }
             break;
 
+        case GatewayState::WANT_CONFIG:
+        case GatewayState::SYNCING:
         case GatewayState::READY:
-            // Nothing to poll — data arrives via fromNum CCCD notifications.
-            // Watchdog / keepalive logic goes here if needed.
+            // fromRadio drain: handle_from_radio_() sets this flag when a
+            // packet was decoded so more may be queued.  We issue the next
+            // read here, outside the NimBLE callback context.
+            if (pending_fromradio_read_) {
+                pending_fromradio_read_ = false;
+                read_fromradio_();
+            }
             break;
 
         default:
@@ -167,8 +174,10 @@ void MeshtasticBLEComponent::handle_from_radio_(const uint8_t *data, size_t len)
             break;
     }
 
-    // Continue draining — read the next packet
-    read_fromradio_();
+    // Signal that more packets may be waiting.  loop() will issue the next
+    // ble_gattc_read() from outside this callback context, which avoids nested
+    // GATTC calls that can deadlock NimBLE on some esp-idf versions.
+    pending_fromradio_read_ = true;
 }
 
 void MeshtasticBLEComponent::handle_mesh_packet_(const meshtastic_MeshPacket &pkt) {
@@ -238,6 +247,10 @@ bool MeshtasticBLEComponent::is_duplicate_(uint32_t packet_id) {
 void MeshtasticBLEComponent::publish_(const std::string &subtopic,
                                        const std::string &payload,
                                        bool retain) {
+    if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) {
+        ESP_LOGV(TAG, "MQTT not ready, dropping: %s", subtopic.c_str());
+        return;
+    }
     const std::string full_topic = topic_prefix_ + "/" + subtopic;
     mqtt::global_mqtt_client->publish(full_topic, payload, 0, retain);
 }

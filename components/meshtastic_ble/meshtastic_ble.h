@@ -99,6 +99,12 @@ class MeshtasticBLEComponent : public Component {
     // ── Timing ────────────────────────────────────────────────────────────────
     uint32_t last_connect_attempt_ms_{0};
 
+    // Set to true by handle_from_radio_() when a non-empty packet was decoded,
+    // signalling that more fromRadio packets may be queued on the node.
+    // Consumed by loop() which issues the next ble_gattc_read() from outside
+    // the NimBLE callback context, avoiding nested GATTC calls.
+    bool pending_fromradio_read_{false};
+
     // ── BLE callbacks (static trampolines required by NimBLE C API) ──────────
     static int on_gap_event_(struct ble_gap_event *event, void *arg);
     static int on_disc_complete_(uint16_t conn_handle, const struct ble_gatt_error *error,
