@@ -13,7 +13,8 @@
 #include "host/ble_gattc.h"
 #include "nimble/nimble_port.h"
 
-#include "gatt_defs.h"
+#include "gatt_defs.h"   // string UUIDs, topic suffixes, packet constants
+#include "ble_uuids.h"   // NimBLE ble_uuid128_t structs (little-endian byte arrays)
 
 // nanopb + generated Meshtastic proto headers (produced by scripts/gen_proto.sh)
 #include "proto/meshtastic/mesh.pb.h"
@@ -98,6 +99,23 @@ class MeshtasticBLEComponent : public Component {
 
     // ── Timing ────────────────────────────────────────────────────────────────
     uint32_t last_connect_attempt_ms_{0};
+
+    // Set to true by handle_from_radio_() when a non-empty packet was decoded,
+    // signalling that more fromRadio packets may be queued on the node.
+    // Consumed by loop() which issues the next ble_gattc_read() from outside
+    // the NimBLE callback context, avoiding nested GATTC calls.
+    bool pending_fromradio_read_{false};
+
+    // ── NimBLE host lifecycle (static — no instance pointer available yet) ───
+    // Called by NimBLE when the host stack has finished initialising and is
+    // ready to accept GAP/GATTC calls.  Triggers the first BLE scan.
+    static void on_sync_();
+    // Called when the NimBLE host resets (e.g. controller watchdog timeout).
+    // Transitions state to IDLE so loop() will re-scan after the backoff period.
+    static void on_reset_(int reason);
+    // FreeRTOS task that runs the NimBLE event loop.  Blocks until
+    // nimble_port_stop() is called (which we never do in normal operation).
+    static void nimble_host_task_(void *param);
 
     // ── BLE callbacks (static trampolines required by NimBLE C API) ──────────
     static int on_gap_event_(struct ble_gap_event *event, void *arg);

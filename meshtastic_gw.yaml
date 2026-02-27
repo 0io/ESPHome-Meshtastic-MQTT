@@ -25,6 +25,39 @@ esp32:
     type: esp-idf
     version: recommended
 
+    # ── NimBLE Kconfig ──────────────────────────────────────────────────────
+    sdkconfig_options:
+      # Enable Bluetooth and select NimBLE (not Bluedroid).
+      # NimBLE is the only BLE host that exposes the low-level GATTC APIs
+      # (ble_gattc_disc_svc_by_uuid, ble_gattc_read, etc.) we rely on.
+      CONFIG_BT_ENABLED: "y"
+      CONFIG_BT_NIMBLE_ENABLED: "y"
+
+      # Central role only — peripheral saves ~20 KB RAM.
+      CONFIG_BT_NIMBLE_ROLE_CENTRAL: "y"
+      CONFIG_BT_NIMBLE_ROLE_PERIPHERAL: "n"
+      CONFIG_BT_NIMBLE_ROLE_BROADCASTER: "n"
+      CONFIG_BT_NIMBLE_ROLE_OBSERVER: "n"
+
+      # Negotiate 512-byte ATT MTU so full fromRadio packets fit in one read.
+      CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU: "512"
+
+      # We only ever connect to one Meshtastic node at a time.
+      CONFIG_BT_NIMBLE_MAX_CONNECTIONS: "1"
+
+      # Device name seen by BLE scanners (informational only for a central).
+      CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME: "meshtastic-gw"
+
+      # Host task stack: NimBLE event loop runs in its own FreeRTOS task.
+      # 5120 bytes is comfortable for the GATT callback chain; increase to
+      # 8192 if you see "***ERROR*** A stack overflow in task nimble_host".
+      CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE: "5120"
+
+    # ── ESPHome loop task ────────────────────────────────────────────────────
+    # The ESPHome loop task handles our state machine and the fromRadio drain.
+    # 16 KB avoids overflow when nanopb decodes large NodeInfo batches.
+    loop_task_stack_size: 16384
+
 external_components:
   - source:
       type: local
