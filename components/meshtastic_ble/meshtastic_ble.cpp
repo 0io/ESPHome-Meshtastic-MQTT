@@ -212,9 +212,18 @@ void MeshtasticBLEComponent::discover_services_() {
 void MeshtasticBLEComponent::subscribe_fromnum_() {
     ESP_LOGI(TAG, "Subscribing to fromNum notifications");
 
-    // TODO: write 0x0001 to the fromNum CCCD to enable notifications
-    //   uint8_t val[2] = {0x01, 0x00};
-    //   ble_gattc_write_flat(conn_handle_, fromnum_cccd_handle_, val, sizeof(val), nullptr, nullptr);
+    // ATT CCCD value: 0x0001 = enable notifications (little-endian uint16).
+    static const uint8_t cccd_notify[2] = {0x01, 0x00};
+
+    // Write the CCCD using a Write Request (ATT_WRITE_REQ).  on_notify_() is
+    // called with the ATT Write Response, then triggers send_want_config_().
+    int rc = ble_gattc_write_flat(conn_handle_, fromnum_cccd_handle_,
+                                   cccd_notify, sizeof(cccd_notify),
+                                   on_notify_, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "CCCD write request failed (rc=%d)", rc);
+        ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
+    }
 }
 
 // ── WantConfig handshake ──────────────────────────────────────────────────────
@@ -223,16 +232,31 @@ void MeshtasticBLEComponent::send_want_config_() {
     ESP_LOGI(TAG, "Sending WantConfig (id=0x%08X)", want_config_id_);
     state_ = GatewayState::WANT_CONFIG;
 
-    // TODO: encode ToRadio{want_config_id: want_config_id_} with nanopb
-    //   meshtastic_ToRadio to_radio = meshtastic_ToRadio_init_zero;
-    //   to_radio.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
-    //   to_radio.payload_variant.want_config_id = want_config_id_;
-    //
-    //   uint8_t buf[64];
-    //   pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    //   pb_encode(&stream, meshtastic_ToRadio_fields, &to_radio);
-    //
-    //   ble_gattc_write_flat(conn_handle_, toradio_handle_, buf, stream.bytes_written, nullptr, nullptr);
+    // Encode ToRadio{want_config_id: N} with nanopb.
+    // A WantConfig payload is a single varint field — 32 bytes is ample.
+    meshtastic_ToRadio to_radio = meshtastic_ToRadio_init_zero;
+    to_radio.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
+    to_radio.payload_variant.want_config_id = want_config_id_;
+
+    uint8_t buf[32];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, meshtastic_ToRadio_fields, &to_radio)) {
+        ESP_LOGE(TAG, "Failed to encode WantConfig: %s", stream.errmsg);
+        return;
+    }
+
+    // toRadio has the WRITE property (not WRITE_WITHOUT_RESPONSE), so use an
+    // ATT Write Request.  We don't need the write response so pass nullptr cb.
+    int rc = ble_gattc_write_flat(conn_handle_, toradio_handle_,
+                                   buf, stream.bytes_written,
+                                   nullptr, nullptr);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "toRadio write (WantConfig) failed (rc=%d)", rc);
+    }
+    // The node will respond with a stream of FromRadio packets: MyNodeInfo,
+    // NodeInfo×N, Channel×C, Config×C, then ConfigComplete.  Each packet
+    // increments fromNum and fires a BLE_GAP_EVENT_NOTIFY_RX which drives
+    // read_fromradio_() via the pending_fromradio_read_ flag in loop().
 }
 
 // ── fromRadio read loop ───────────────────────────────────────────────────────
@@ -584,8 +608,27 @@ int MeshtasticBLEComponent::on_desc_discovered_(uint16_t conn_handle,
     }
 
     // All required handles discovered.  Subscribe to fromNum notifications, then
-    // send WantConfig to kick off the config sync stream (step 7).
+    // send WantConfig to kick off the config sync stream.
     self->subscribe_fromnum_();
+    return 0;
+}
+
+// ATT Write Response callback for the CCCD write issued by subscribe_fromnum_().
+// Called by NimBLE when the peer acknowledges the Write Request.
+int MeshtasticBLEComponent::on_notify_(uint16_t conn_handle,
+                                        const struct ble_gatt_error *error,
+                                        struct ble_gatt_attr *attr,
+                                        void *arg) {
+    auto *self = static_cast<MeshtasticBLEComponent *>(arg);
+
+    if (error->status != 0) {
+        ESP_LOGE(TAG, "CCCD write (notify enable) failed (status=%d)", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "fromNum notifications enabled — sending WantConfig");
+    self->send_want_config_();
     return 0;
 }
 
