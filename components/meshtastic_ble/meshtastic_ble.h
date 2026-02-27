@@ -105,6 +105,17 @@ class MeshtasticBLEComponent : public Component {
     // the NimBLE callback context, avoiding nested GATTC calls.
     bool pending_fromradio_read_{false};
 
+    // ── NimBLE host lifecycle (static — no instance pointer available yet) ───
+    // Called by NimBLE when the host stack has finished initialising and is
+    // ready to accept GAP/GATTC calls.  Triggers the first BLE scan.
+    static void on_sync_();
+    // Called when the NimBLE host resets (e.g. controller watchdog timeout).
+    // Transitions state to IDLE so loop() will re-scan after the backoff period.
+    static void on_reset_(int reason);
+    // FreeRTOS task that runs the NimBLE event loop.  Blocks until
+    // nimble_port_stop() is called (which we never do in normal operation).
+    static void nimble_host_task_(void *param);
+
     // ── BLE callbacks (static trampolines required by NimBLE C API) ──────────
     static int on_gap_event_(struct ble_gap_event *event, void *arg);
     static int on_disc_complete_(uint16_t conn_handle, const struct ble_gatt_error *error,

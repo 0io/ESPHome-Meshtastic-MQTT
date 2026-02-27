@@ -15,6 +15,11 @@
 namespace esphome {
 namespace meshtastic_ble {
 
+// Module-level pointer used by the static NimBLE callbacks (on_sync_,
+// on_reset_) which receive no user-data argument from the NimBLE API.
+// Safe because ESPHome creates exactly one instance of this component.
+static MeshtasticBLEComponent *s_instance = nullptr;
+
 // ── ESPHome lifecycle ─────────────────────────────────────────────────────────
 
 void MeshtasticBLEComponent::setup() {
@@ -22,12 +27,84 @@ void MeshtasticBLEComponent::setup() {
     ESP_LOGI(TAG, "  Node name   : %s", node_name_.c_str());
     ESP_LOGI(TAG, "  Topic prefix: %s", topic_prefix_.c_str());
 
-    // TODO: initialise NimBLE host and GAP callbacks
-    //   nimble_port_init();
-    //   ble_hs_cfg.sync_cb = on_sync_;
-    //   nimble_port_freertos_init(nimble_host_task_);
+    // Stash the instance pointer for use by static NimBLE callbacks.
+    s_instance = this;
 
+    // Publish offline availability immediately so HA marks the gateway
+    // unavailable until BLE sync completes and we flip it to online.
     publish_availability_(false);
+
+    // ── NimBLE host initialisation ──────────────────────────────────────────
+    // nimble_port_init() prepares the NimBLE controller and host layers.
+    // It must be called before any ble_* API calls.
+    int rc = nimble_port_init();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "nimble_port_init failed (rc=%d) — BLE unavailable", rc);
+        this->mark_failed();
+        return;
+    }
+
+    // Register the sync and reset callbacks.
+    // on_sync_ fires once the host has exchanged LE features with the
+    // controller and is ready for GAP/GATTC operations.
+    ble_hs_cfg.sync_cb  = on_sync_;
+    // on_reset_ fires if the controller resets unexpectedly (e.g. watchdog).
+    ble_hs_cfg.reset_cb = on_reset_;
+
+    // Initialise the GAP service (sets device name, appearance, etc.).
+    ble_svc_gap_init();
+
+    // Start the NimBLE host task on core 1 (dual-core) or the only core.
+    // nimble_port_freertos_init() creates a FreeRTOS task that runs
+    // nimble_port_run(), blocking until nimble_port_stop() is called.
+    nimble_port_freertos_init(nimble_host_task_);
+
+    ESP_LOGI(TAG, "NimBLE host task started — waiting for sync");
+}
+
+// ── NimBLE host lifecycle callbacks ──────────────────────────────────────────
+
+void MeshtasticBLEComponent::on_sync_() {
+    // The NimBLE host has synchronised with the controller and is ready.
+    // Infer the best available own address type (public or random) and
+    // kick off the first BLE scan.
+    ESP_LOGI(TAG, "NimBLE host synced");
+
+    int rc = ble_hs_util_ensure_addr(0);  // 0 = prefer public address
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_hs_util_ensure_addr failed (rc=%d), using random", rc);
+    }
+
+    if (s_instance != nullptr) {
+        // Trigger the first scan immediately rather than waiting for the
+        // reconnect_interval_ timer to fire.
+        s_instance->last_connect_attempt_ms_ = 0;
+        s_instance->state_ = GatewayState::IDLE;
+    }
+}
+
+void MeshtasticBLEComponent::on_reset_(int reason) {
+    // The controller reset — all existing connections are gone.
+    ESP_LOGW(TAG, "NimBLE host reset (reason=%d)", reason);
+    if (s_instance != nullptr) {
+        s_instance->conn_handle_      = BLE_HS_CONN_HANDLE_NONE;
+        s_instance->state_            = GatewayState::IDLE;
+        s_instance->config_complete_  = false;
+        s_instance->pending_fromradio_read_ = false;
+        // publish_availability_ calls into MQTT — safe to call here because
+        // this callback runs in the NimBLE host task, not an ISR.
+        s_instance->publish_availability_(false);
+    }
+}
+
+void MeshtasticBLEComponent::nimble_host_task_(void *param) {
+    ESP_LOGI(TAG, "NimBLE host task running");
+    // nimble_port_run() blocks, processing NimBLE events until
+    // nimble_port_stop() is called.  In normal operation this task runs
+    // forever alongside the ESPHome loop task.
+    nimble_port_run();
+    // Reached only if nimble_port_stop() is called (e.g. during shutdown).
+    nimble_port_freertos_deinit();
 }
 
 void MeshtasticBLEComponent::loop() {
