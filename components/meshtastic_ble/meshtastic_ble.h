@@ -107,6 +107,12 @@ class MeshtasticBLEComponent : public Component {
     // the NimBLE callback context, avoiding nested GATTC calls.
     bool pending_fromradio_read_{false};
 
+    // True while a ble_gattc_read() is outstanding on fromRadio.
+    // Prevents overlapping reads when a second fromNum notification arrives
+    // before the current read callback fires.  volatile because it is written
+    // by the NimBLE host task and read by the ESPHome loop task.
+    volatile bool read_in_flight_{false};
+
     // ── NimBLE host lifecycle (static — no instance pointer available yet) ───
     // Called by NimBLE when the host stack has finished initialising and is
     // ready to accept GAP/GATTC calls.  Triggers the first BLE scan.
@@ -145,6 +151,8 @@ class MeshtasticBLEComponent : public Component {
     void handle_my_node_info_(const meshtastic_MyNodeInfo &info);
     void handle_node_info_(const meshtastic_NodeInfo &info);
     void handle_config_complete_(uint32_t config_id);
+
+    void send_text_message_(const std::string &text);
 
     bool is_duplicate_(uint32_t packet_id);
 

@@ -58,8 +58,20 @@ void MeshtasticBLEComponent::setup() {
     // nimble_port_freertos_init() creates a FreeRTOS task that runs
     // nimble_port_run(), blocking until nimble_port_stop() is called.
     nimble_port_freertos_init(nimble_host_task_);
-
     ESP_LOGI(TAG, "NimBLE host task started — waiting for sync");
+
+    // ── MQTT command subscriptions ──────────────────────────────────────────
+    // ESPHome's MQTT client stores subscriptions and re-sends them on every
+    // reconnect, so registering here in setup() is sufficient.
+    if (mqtt::global_mqtt_client != nullptr) {
+        const std::string send_topic = topic_prefix_ + "/send/text";
+        mqtt::global_mqtt_client->subscribe(
+            send_topic,
+            [this](const std::string & /*topic*/, const std::string &payload) {
+                this->send_text_message_(payload);
+            });
+        ESP_LOGI(TAG, "Subscribed to MQTT command: %s", send_topic.c_str());
+    }
 }
 
 // ── NimBLE host lifecycle callbacks ──────────────────────────────────────────
@@ -262,11 +274,48 @@ void MeshtasticBLEComponent::send_want_config_() {
 // ── fromRadio read loop ───────────────────────────────────────────────────────
 
 void MeshtasticBLEComponent::read_fromradio_() {
-    // Called after each fromNum notification.  Must loop until server returns
-    // an empty (0-byte) response.
+    // Guard against overlapping reads: if a read is already in flight (e.g.
+    // a second fromNum notification arrived before on_fromradio_read_ fires),
+    // pending_fromradio_read_ is still set so loop() will retry after it clears.
+    if (read_in_flight_) return;
+    read_in_flight_ = true;
 
-    // TODO:
-    //   ble_gattc_read(conn_handle_, fromradio_handle_, on_fromradio_read_, this);
+    int rc = ble_gattc_read(conn_handle_, fromradio_handle_, on_fromradio_read_, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_read failed (rc=%d)", rc);
+        read_in_flight_ = false;
+    }
+}
+
+int MeshtasticBLEComponent::on_fromradio_read_(uint16_t conn_handle,
+                                                const struct ble_gatt_error *error,
+                                                struct ble_gatt_attr *attr,
+                                                void *arg) {
+    auto *self = static_cast<MeshtasticBLEComponent *>(arg);
+    self->read_in_flight_ = false;
+
+    if (error->status != 0) {
+        ESP_LOGE(TAG, "fromRadio read error (status=%d)", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+    if (attr == nullptr) return 0;
+
+    // Flatten the mbuf chain into a stack buffer.  MESHTASTIC_MAX_PACKET_LEN
+    // (512) covers the full ATT MTU we negotiated.
+    uint8_t buf[MESHTASTIC_MAX_PACKET_LEN];
+    uint16_t out_len = 0;
+    int rc = ble_hs_mbuf_to_flat(attr->om, buf, sizeof(buf), &out_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_mbuf_to_flat failed (rc=%d)", rc);
+        return 0;
+    }
+
+    // Dispatch to the packet handler.  handle_from_radio_() sets
+    // pending_fromradio_read_ = true for non-empty packets so loop() issues
+    // the next read from outside this NimBLE callback context.
+    self->handle_from_radio_(buf, out_len);
+    return 0;
 }
 
 // ── Packet handling ───────────────────────────────────────────────────────────
@@ -315,27 +364,89 @@ void MeshtasticBLEComponent::handle_mesh_packet_(const meshtastic_MeshPacket &pk
         return;
     }
 
-    ESP_LOGD(TAG, "MeshPacket from=0x%08X id=0x%08X", pkt.from, pkt.id);
+    // Only process decoded (unencrypted or already decrypted by the node) packets.
+    if (pkt.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        ESP_LOGD(TAG, "Skipping encrypted MeshPacket from 0x%08X", pkt.from);
+        return;
+    }
 
-    // TODO: decode pkt.decoded (meshtastic_Data) and route by portnum
-    //
-    // switch (pkt.decoded.portnum) {
-    //     case meshtastic_PortNum_TEXT_MESSAGE_APP:
-    //         publish_(node_topic_(pkt.from, TOPIC_TEXT),
-    //                  std::string((char *)pkt.decoded.payload.bytes, pkt.decoded.payload.size));
-    //         break;
-    //     case meshtastic_PortNum_TELEMETRY_APP:
-    //         // decode meshtastic_Telemetry, publish sub-fields
-    //         break;
-    //     case meshtastic_PortNum_POSITION_APP:
-    //         // decode meshtastic_Position, publish lat/lon/alt
-    //         break;
-    //     case meshtastic_PortNum_NODEINFO_APP:
-    //         // decode meshtastic_User, publish long_name/hw_model
-    //         break;
-    //     default:
-    //         break;
-    // }
+    const meshtastic_Data &d = pkt.payload_variant.decoded;
+    ESP_LOGD(TAG, "MeshPacket from=0x%08X portnum=%d", pkt.from, d.portnum);
+
+    char val[32];
+
+    switch (d.portnum) {
+        case meshtastic_PortNum_TEXT_MESSAGE_APP: {
+            // Payload is raw UTF-8 text.
+            const std::string text(reinterpret_cast<const char *>(d.payload.bytes),
+                                   d.payload.size);
+            publish_(node_topic_(pkt.from, TOPIC_TEXT), text);
+            ESP_LOGI(TAG, "Text from 0x%08X: %s", pkt.from, text.c_str());
+            break;
+        }
+
+        case meshtastic_PortNum_POSITION_APP: {
+            meshtastic_Position pos = meshtastic_Position_init_zero;
+            pb_istream_t s = pb_istream_from_buffer(d.payload.bytes, d.payload.size);
+            if (!pb_decode(&s, meshtastic_Position_fields, &pos)) {
+                ESP_LOGW(TAG, "Position decode failed: %s", s.errmsg);
+                break;
+            }
+            if (pos.has_latitude_i) {
+                snprintf(val, sizeof(val), "%.7f", pos.latitude_i / 1e7);
+                publish_(node_topic_(pkt.from, TOPIC_POSITION_LAT), val);
+            }
+            if (pos.has_longitude_i) {
+                snprintf(val, sizeof(val), "%.7f", pos.longitude_i / 1e7);
+                publish_(node_topic_(pkt.from, TOPIC_POSITION_LON), val);
+            }
+            if (pos.has_altitude) {
+                snprintf(val, sizeof(val), "%d", pos.altitude);
+                publish_(node_topic_(pkt.from, TOPIC_POSITION_ALT), val);
+            }
+            break;
+        }
+
+        case meshtastic_PortNum_NODEINFO_APP: {
+            meshtastic_User user = meshtastic_User_init_zero;
+            pb_istream_t s = pb_istream_from_buffer(d.payload.bytes, d.payload.size);
+            if (!pb_decode(&s, meshtastic_User_fields, &user)) {
+                ESP_LOGW(TAG, "User decode failed: %s", s.errmsg);
+                break;
+            }
+            publish_(node_topic_(pkt.from, TOPIC_NODEINFO_NAME), user.long_name, true);
+            ESP_LOGI(TAG, "NodeInfo from 0x%08X: %s (%s)", pkt.from,
+                     user.long_name, user.short_name);
+            break;
+        }
+
+        case meshtastic_PortNum_TELEMETRY_APP: {
+            meshtastic_Telemetry tel = meshtastic_Telemetry_init_zero;
+            pb_istream_t s = pb_istream_from_buffer(d.payload.bytes, d.payload.size);
+            if (!pb_decode(&s, meshtastic_Telemetry_fields, &tel)) {
+                ESP_LOGW(TAG, "Telemetry decode failed: %s", s.errmsg);
+                break;
+            }
+            if (tel.which_variant == meshtastic_Telemetry_device_metrics_tag) {
+                const meshtastic_DeviceMetrics &dm = tel.variant.device_metrics;
+                snprintf(val, sizeof(val), "%u", dm.battery_level);
+                publish_(node_topic_(pkt.from, TOPIC_TEL_BATTERY), val);
+                snprintf(val, sizeof(val), "%.2f", dm.voltage);
+                publish_(node_topic_(pkt.from, TOPIC_TEL_VOLTAGE), val);
+            } else if (tel.which_variant == meshtastic_Telemetry_environment_metrics_tag) {
+                const meshtastic_EnvironmentMetrics &em = tel.variant.environment_metrics;
+                snprintf(val, sizeof(val), "%.1f", em.temperature);
+                publish_(node_topic_(pkt.from, TOPIC_TEL_TEMP), val);
+                snprintf(val, sizeof(val), "%.1f", em.relative_humidity);
+                publish_(node_topic_(pkt.from, TOPIC_TEL_HUMIDITY), val);
+            }
+            break;
+        }
+
+        default:
+            ESP_LOGD(TAG, "Unhandled portnum %d from 0x%08X", d.portnum, pkt.from);
+            break;
+    }
 }
 
 void MeshtasticBLEComponent::handle_my_node_info_(const meshtastic_MyNodeInfo &info) {
@@ -344,8 +455,16 @@ void MeshtasticBLEComponent::handle_my_node_info_(const meshtastic_MyNodeInfo &i
 }
 
 void MeshtasticBLEComponent::handle_node_info_(const meshtastic_NodeInfo &info) {
-    ESP_LOGD(TAG, "NodeInfo: num=0x%08X name=%s", info.num, info.user.long_name);
-    // TODO: store in node table, publish discovery payload
+    if (info.num == 0) return;
+    ESP_LOGI(TAG, "NodeInfo: num=0x%08X name=%s", info.num, info.user.long_name);
+
+    // Publish as retained so Home Assistant restores values after a gateway restart.
+    publish_(node_topic_(info.num, TOPIC_NODEINFO_NAME), info.user.long_name, true);
+
+    // Advance state on the first NodeInfo received so loop() knows we're syncing.
+    if (state_ == GatewayState::WANT_CONFIG) {
+        state_ = GatewayState::SYNCING;
+    }
 }
 
 void MeshtasticBLEComponent::handle_config_complete_(uint32_t config_id) {
@@ -630,6 +749,52 @@ int MeshtasticBLEComponent::on_notify_(uint16_t conn_handle,
     ESP_LOGI(TAG, "fromNum notifications enabled — sending WantConfig");
     self->send_want_config_();
     return 0;
+}
+
+// ── MQTT command handlers ─────────────────────────────────────────────────────
+
+void MeshtasticBLEComponent::send_text_message_(const std::string &text) {
+    if (state_ != GatewayState::READY) {
+        ESP_LOGW(TAG, "Dropping outbound text — not connected (state=%d)",
+                 static_cast<int>(state_));
+        return;
+    }
+    if (text.empty()) return;
+
+    ESP_LOGI(TAG, "Sending text message: %s", text.c_str());
+
+    meshtastic_ToRadio to_radio = meshtastic_ToRadio_init_zero;
+    to_radio.which_payload_variant = meshtastic_ToRadio_packet_tag;
+
+    meshtastic_MeshPacket &pkt = to_radio.payload_variant.packet;
+    pkt.to       = UINT32_MAX;   // 0xFFFFFFFF = broadcast
+    pkt.from     = my_node_num_;
+    pkt.id       = static_cast<uint32_t>(millis());  // simple monotonic ID
+    pkt.want_ack = false;
+    pkt.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+
+    meshtastic_Data &d = pkt.payload_variant.decoded;
+    d.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+
+    // Copy text into the fixed nanopb bytes array (max 233 bytes per proto options).
+    const size_t copy_len = std::min(text.size(),
+                                     static_cast<size_t>(sizeof(d.payload.bytes)));
+    memcpy(d.payload.bytes, text.c_str(), copy_len);
+    d.payload.size = static_cast<pb_size_t>(copy_len);
+
+    uint8_t buf[MESHTASTIC_MAX_PACKET_LEN];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, meshtastic_ToRadio_fields, &to_radio)) {
+        ESP_LOGE(TAG, "Failed to encode outbound text: %s", stream.errmsg);
+        return;
+    }
+
+    int rc = ble_gattc_write_flat(conn_handle_, toradio_handle_,
+                                   buf, stream.bytes_written,
+                                   nullptr, nullptr);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "toRadio write (text) failed (rc=%d)", rc);
+    }
 }
 
 }  // namespace meshtastic_ble

@@ -19,11 +19,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Tag or branch to fetch from the Meshtastic protobufs repository.
-MESHTASTIC_PROTO_VERSION="${MESHTASTIC_PROTO_VERSION:-v2.5}"
+MESHTASTIC_PROTO_VERSION="${MESHTASTIC_PROTO_VERSION:-v2.7.19}"
 
 # Pinned nanopb version — keep in sync with what esp-idf ships, or use a
 # standalone install.
-NANOPB_VERSION="${NANOPB_VERSION:-0.4.8}"
+NANOPB_VERSION="${NANOPB_VERSION:-0.4.9.1}"
 
 PROTO_SRC_DIR="$REPO_ROOT/.proto_src"
 PROTO_OUT_DIR="$REPO_ROOT/components/meshtastic_ble/proto"
