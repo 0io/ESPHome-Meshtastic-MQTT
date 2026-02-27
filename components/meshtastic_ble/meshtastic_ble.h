@@ -76,6 +76,7 @@ class MeshtasticBLEComponent : public Component {
 
     // ── BLE state ─────────────────────────────────────────────────────────────
     GatewayState state_{GatewayState::IDLE};
+    uint8_t own_addr_type_{BLE_OWN_ADDR_PUBLIC};  // resolved in start_scan_()
     uint16_t conn_handle_{BLE_HS_CONN_HANDLE_NONE};
     ble_addr_t peer_addr_{};
 

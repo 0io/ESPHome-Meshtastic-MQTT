@@ -152,12 +152,26 @@ void MeshtasticBLEComponent::start_scan_() {
     ESP_LOGI(TAG, "Starting BLE scan for '%s'", node_name_.c_str());
     state_ = GatewayState::SCANNING;
 
-    // TODO: configure and start a passive GAP scan
-    //   struct ble_gap_disc_params disc_params = {};
-    //   disc_params.passive = 1;
-    //   disc_params.itvl    = BLE_GAP_SCAN_ITVL_MS(200);
-    //   disc_params.window  = BLE_GAP_SCAN_WIN_MS(150);
-    //   ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, on_gap_event_, this);
+    // Resolve the best available own address type (public preferred).
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type_);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed (rc=%d)", rc);
+        state_ = GatewayState::IDLE;
+        return;
+    }
+
+    struct ble_gap_disc_params disc_params = {};
+    disc_params.passive     = 1;   // passive scan — no scan requests sent
+    disc_params.filter_dups = 1;   // suppress duplicate advertising reports
+    disc_params.itvl        = BLE_GAP_SCAN_ITVL_MS(200);
+    disc_params.window      = BLE_GAP_SCAN_WIN_MS(150);
+
+    // BLE_HS_FOREVER: scan until we find the device and call ble_gap_disc_cancel().
+    rc = ble_gap_disc(own_addr_type_, BLE_HS_FOREVER, &disc_params, on_gap_event_, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_disc failed (rc=%d)", rc);
+        state_ = GatewayState::IDLE;
+    }
 }
 
 void MeshtasticBLEComponent::connect_(const ble_addr_t &addr) {
@@ -165,9 +179,20 @@ void MeshtasticBLEComponent::connect_(const ble_addr_t &addr) {
     state_ = GatewayState::CONNECTING;
     peer_addr_ = addr;
 
-    // TODO: stop scan, then initiate connection
-    //   ble_gap_disc_cancel();
-    //   ble_gap_connect(own_addr_type, &addr, 5000, nullptr, on_gap_event_, this);
+    // Cancel the scan before initiating a connection (NimBLE requires this).
+    // The resulting BLE_GAP_EVENT_DISC_COMPLETE is harmless — state_ is already
+    // CONNECTING so the SCANNING guard in that handler won't fire.
+    ble_gap_disc_cancel();
+
+    // nullptr for conn_params uses NimBLE defaults (suitable for most nodes).
+    // 5000 ms timeout: if the connection isn't established in 5 s, NimBLE fires
+    // BLE_GAP_EVENT_CONNECT with a non-zero status and we fall back to IDLE.
+    int rc = ble_gap_connect(own_addr_type_, &peer_addr_, 5000,
+                             nullptr, on_gap_event_, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_connect failed (rc=%d)", rc);
+        state_ = GatewayState::IDLE;
+    }
 }
 
 // ── GATT discovery ────────────────────────────────────────────────────────────
@@ -176,9 +201,12 @@ void MeshtasticBLEComponent::discover_services_() {
     ESP_LOGI(TAG, "Discovering GATT services");
     state_ = GatewayState::DISCOVERING;
 
-    // TODO: discover the Meshtastic service by UUID
-    //   ble_gattc_disc_svc_by_uuid(conn_handle_, &MESH_SVC_UUID.u,
-    //                               on_disc_complete_, this);
+    int rc = ble_gattc_disc_svc_by_uuid(conn_handle_, &MESH_SVC_UUID.u,
+                                         on_disc_complete_, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_svc_by_uuid failed (rc=%d)", rc);
+        ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
+    }
 }
 
 void MeshtasticBLEComponent::subscribe_fromnum_() {
@@ -348,8 +376,55 @@ int MeshtasticBLEComponent::on_gap_event_(struct ble_gap_event *event, void *arg
     auto *self = static_cast<MeshtasticBLEComponent *>(arg);
 
     switch (event->type) {
-        case BLE_GAP_EVENT_DISC:
-            // TODO: check advertised name/MAC, call self->connect_() if matched
+        case BLE_GAP_EVENT_DISC: {
+            // Only act on discovery events while we are still scanning.
+            if (self->state_ != GatewayState::SCANNING) break;
+
+            const struct ble_gap_disc_desc *disc = &event->disc;
+
+            if (self->use_mac_) {
+                // Match by MAC address.  node_mac_ is big-endian (AA…FF for
+                // "AA:BB:CC:DD:EE:FF"), BLE val[] is little-endian (FF…AA).
+                uint8_t mac_le[6];
+                uint64_t m = self->node_mac_;
+                for (int i = 0; i < 6; i++) {
+                    mac_le[i] = m & 0xFF;
+                    m >>= 8;
+                }
+                if (memcmp(disc->addr.val, mac_le, 6) == 0) {
+                    ESP_LOGI(TAG, "Matched Meshtastic node by MAC");
+                    self->connect_(disc->addr);
+                }
+                break;
+            }
+
+            // Match by advertised device name (substring in either direction).
+            struct ble_hs_adv_fields fields;
+            if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) break;
+            if (fields.name == nullptr || fields.name_len == 0) break;
+
+            const std::string adv_name(reinterpret_cast<const char *>(fields.name),
+                                       fields.name_len);
+            if (adv_name.find(self->node_name_) != std::string::npos ||
+                self->node_name_.find(adv_name) != std::string::npos) {
+                ESP_LOGI(TAG, "Matched Meshtastic node by name: %s", adv_name.c_str());
+                self->connect_(disc->addr);
+            }
+            break;
+        }
+
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            // Fired when the scan window expires or is cancelled by connect_().
+            // If we are still scanning (device not found) fall back to IDLE.
+            if (self->state_ == GatewayState::SCANNING) {
+                ESP_LOGW(TAG, "BLE scan complete — device not found");
+                self->state_ = GatewayState::IDLE;
+            }
+            break;
+
+        case BLE_GAP_EVENT_MTU:
+            ESP_LOGI(TAG, "MTU negotiated: conn=%d mtu=%d",
+                     event->mtu.conn_handle, event->mtu.value);
             break;
 
         case BLE_GAP_EVENT_CONNECT:
@@ -381,6 +456,136 @@ int MeshtasticBLEComponent::on_gap_event_(struct ble_gap_event *event, void *arg
         default:
             break;
     }
+    return 0;
+}
+
+// ── GATT discovery callbacks ──────────────────────────────────────────────────
+
+// Called once for each matching service and then once more with service == nullptr
+// (BLE_HS_EDONE) to signal completion.
+int MeshtasticBLEComponent::on_disc_complete_(uint16_t conn_handle,
+                                               const struct ble_gatt_error *error,
+                                               const struct ble_gatt_svc *service,
+                                               void *arg) {
+    auto *self = static_cast<MeshtasticBLEComponent *>(arg);
+
+    if (error->status != 0 && error->status != BLE_HS_EDONE) {
+        ESP_LOGE(TAG, "Service discovery error (status=%d)", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    if (service != nullptr) {
+        // Meshtastic service found — record its attribute handle range.
+        self->svc_start_handle_ = service->start_handle;
+        self->svc_end_handle_   = service->end_handle;
+        ESP_LOGI(TAG, "Meshtastic service found (handles %d–%d)",
+                 service->start_handle, service->end_handle);
+        return 0;
+    }
+
+    // service == nullptr: discovery complete (BLE_HS_EDONE).
+    if (self->svc_start_handle_ == 0) {
+        ESP_LOGE(TAG, "Meshtastic GATT service not found — disconnecting");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    // Discover all characteristics within the Meshtastic service.
+    int rc = ble_gattc_disc_all_chrs(conn_handle,
+                                      self->svc_start_handle_,
+                                      self->svc_end_handle_,
+                                      on_chr_discovered_, self);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_all_chrs failed (rc=%d)", rc);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    return 0;
+}
+
+// Called once per characteristic and then once more with chr == nullptr (BLE_HS_EDONE).
+int MeshtasticBLEComponent::on_chr_discovered_(uint16_t conn_handle,
+                                                const struct ble_gatt_error *error,
+                                                const struct ble_gatt_chr *chr,
+                                                void *arg) {
+    auto *self = static_cast<MeshtasticBLEComponent *>(arg);
+
+    if (error->status != 0 && error->status != BLE_HS_EDONE) {
+        ESP_LOGE(TAG, "Characteristic discovery error (status=%d)", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    if (chr != nullptr) {
+        // Match each discovered characteristic by UUID and store its value handle.
+        if (ble_uuid_cmp(&chr->uuid.u, &TORADIO_CHR_UUID.u) == 0) {
+            self->toradio_handle_ = chr->val_handle;
+            ESP_LOGI(TAG, "toRadio characteristic handle: %d", self->toradio_handle_);
+        } else if (ble_uuid_cmp(&chr->uuid.u, &FROMRADIO_CHR_UUID.u) == 0) {
+            self->fromradio_handle_ = chr->val_handle;
+            ESP_LOGI(TAG, "fromRadio characteristic handle: %d", self->fromradio_handle_);
+        } else if (ble_uuid_cmp(&chr->uuid.u, &FROMNUM_CHR_UUID.u) == 0) {
+            self->fromnum_handle_ = chr->val_handle;
+            ESP_LOGI(TAG, "fromNum characteristic handle: %d", self->fromnum_handle_);
+        }
+        return 0;
+    }
+
+    // chr == nullptr: all characteristics have been reported (BLE_HS_EDONE).
+    if (self->toradio_handle_ == 0 || self->fromradio_handle_ == 0 ||
+        self->fromnum_handle_ == 0) {
+        ESP_LOGE(TAG, "One or more required characteristics not found");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    // Discover descriptors for the fromNum characteristic to locate its CCCD.
+    // The CCCD descriptor for fromNum lies between fromnum_handle_ and
+    // svc_end_handle_ — using the full service range is safe.
+    int rc = ble_gattc_disc_all_dscs(conn_handle,
+                                      self->fromnum_handle_,
+                                      self->svc_end_handle_,
+                                      on_desc_discovered_, self);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_all_dscs failed (rc=%d)", rc);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    return 0;
+}
+
+// Called once per descriptor and then once more with dsc == nullptr (BLE_HS_EDONE).
+int MeshtasticBLEComponent::on_desc_discovered_(uint16_t conn_handle,
+                                                  const struct ble_gatt_error *error,
+                                                  uint16_t chr_val_handle,
+                                                  const struct ble_gatt_dsc *dsc,
+                                                  void *arg) {
+    auto *self = static_cast<MeshtasticBLEComponent *>(arg);
+
+    if (error->status != 0 && error->status != BLE_HS_EDONE) {
+        ESP_LOGE(TAG, "Descriptor discovery error (status=%d)", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    if (dsc != nullptr) {
+        // Look for the standard CCCD descriptor (0x2902).
+        if (ble_uuid_cmp(&dsc->uuid.u, &CCCD_UUID.u) == 0) {
+            self->fromnum_cccd_handle_ = dsc->handle;
+            ESP_LOGI(TAG, "fromNum CCCD handle: %d", self->fromnum_cccd_handle_);
+        }
+        return 0;
+    }
+
+    // dsc == nullptr: all descriptors have been reported (BLE_HS_EDONE).
+    if (self->fromnum_cccd_handle_ == 0) {
+        ESP_LOGE(TAG, "fromNum CCCD not found — cannot subscribe to notifications");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    // All required handles discovered.  Subscribe to fromNum notifications, then
+    // send WantConfig to kick off the config sync stream (step 7).
+    self->subscribe_fromnum_();
     return 0;
 }
 
