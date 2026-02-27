@@ -177,8 +177,8 @@ void MeshtasticBLEComponent::discover_services_() {
     state_ = GatewayState::DISCOVERING;
 
     // TODO: discover the Meshtastic service by UUID
-    //   ble_uuid128_t svc_uuid = ...;
-    //   ble_gattc_disc_svc_by_uuid(conn_handle_, &svc_uuid.u, on_disc_complete_, this);
+    //   ble_gattc_disc_svc_by_uuid(conn_handle_, &MESH_SVC_UUID.u,
+    //                               on_disc_complete_, this);
 }
 
 void MeshtasticBLEComponent::subscribe_fromnum_() {

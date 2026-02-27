@@ -13,7 +13,8 @@
 #include "host/ble_gattc.h"
 #include "nimble/nimble_port.h"
 
-#include "gatt_defs.h"
+#include "gatt_defs.h"   // string UUIDs, topic suffixes, packet constants
+#include "ble_uuids.h"   // NimBLE ble_uuid128_t structs (little-endian byte arrays)
 
 // nanopb + generated Meshtastic proto headers (produced by scripts/gen_proto.sh)
 #include "proto/meshtastic/mesh.pb.h"
