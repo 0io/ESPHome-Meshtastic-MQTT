@@ -14,6 +14,7 @@ from esphome.const import CONF_ID
 # esp-idf framework is required; BLE APIs come from NimBLE via esp-idf.
 DEPENDENCIES = ["esp32"]
 AUTO_LOAD = ["mqtt"]
+MULTI_CONF = False  # Only one Meshtastic BLE gateway instance is supported.
 
 # ── Namespace / class registration ────────────────────────────────────────────
 meshtastic_ble_ns = cg.esphome_ns.namespace("meshtastic_ble")

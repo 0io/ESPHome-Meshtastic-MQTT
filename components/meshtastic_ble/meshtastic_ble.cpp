@@ -248,7 +248,7 @@ void MeshtasticBLEComponent::send_want_config_() {
     // A WantConfig payload is a single varint field — 32 bytes is ample.
     meshtastic_ToRadio to_radio = meshtastic_ToRadio_init_zero;
     to_radio.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
-    to_radio.payload_variant.want_config_id = want_config_id_;
+    to_radio.want_config_id = want_config_id_;
 
     uint8_t buf[32];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
@@ -336,16 +336,16 @@ void MeshtasticBLEComponent::handle_from_radio_(const uint8_t *data, size_t len)
 
     switch (from_radio.which_payload_variant) {
         case meshtastic_FromRadio_packet_tag:
-            handle_mesh_packet_(from_radio.payload_variant.packet);
+            handle_mesh_packet_(from_radio.packet);
             break;
         case meshtastic_FromRadio_my_info_tag:
-            handle_my_node_info_(from_radio.payload_variant.my_info);
+            handle_my_node_info_(from_radio.my_info);
             break;
         case meshtastic_FromRadio_node_info_tag:
-            handle_node_info_(from_radio.payload_variant.node_info);
+            handle_node_info_(from_radio.node_info);
             break;
         case meshtastic_FromRadio_config_complete_id_tag:
-            handle_config_complete_(from_radio.payload_variant.config_complete_id);
+            handle_config_complete_(from_radio.config_complete_id);
             break;
         default:
             ESP_LOGD(TAG, "Unhandled FromRadio variant: %d", from_radio.which_payload_variant);
@@ -370,7 +370,7 @@ void MeshtasticBLEComponent::handle_mesh_packet_(const meshtastic_MeshPacket &pk
         return;
     }
 
-    const meshtastic_Data &d = pkt.payload_variant.decoded;
+    const meshtastic_Data &d = pkt.decoded;
     ESP_LOGD(TAG, "MeshPacket from=0x%08X portnum=%d", pkt.from, d.portnum);
 
     char val[32];
@@ -429,16 +429,24 @@ void MeshtasticBLEComponent::handle_mesh_packet_(const meshtastic_MeshPacket &pk
             }
             if (tel.which_variant == meshtastic_Telemetry_device_metrics_tag) {
                 const meshtastic_DeviceMetrics &dm = tel.variant.device_metrics;
-                snprintf(val, sizeof(val), "%u", dm.battery_level);
-                publish_(node_topic_(pkt.from, TOPIC_TEL_BATTERY), val);
-                snprintf(val, sizeof(val), "%.2f", dm.voltage);
-                publish_(node_topic_(pkt.from, TOPIC_TEL_VOLTAGE), val);
+                if (dm.has_battery_level) {
+                    snprintf(val, sizeof(val), "%u", dm.battery_level);
+                    publish_(node_topic_(pkt.from, TOPIC_TEL_BATTERY), val);
+                }
+                if (dm.has_voltage) {
+                    snprintf(val, sizeof(val), "%.2f", dm.voltage);
+                    publish_(node_topic_(pkt.from, TOPIC_TEL_VOLTAGE), val);
+                }
             } else if (tel.which_variant == meshtastic_Telemetry_environment_metrics_tag) {
                 const meshtastic_EnvironmentMetrics &em = tel.variant.environment_metrics;
-                snprintf(val, sizeof(val), "%.1f", em.temperature);
-                publish_(node_topic_(pkt.from, TOPIC_TEL_TEMP), val);
-                snprintf(val, sizeof(val), "%.1f", em.relative_humidity);
-                publish_(node_topic_(pkt.from, TOPIC_TEL_HUMIDITY), val);
+                if (em.has_temperature) {
+                    snprintf(val, sizeof(val), "%.1f", em.temperature);
+                    publish_(node_topic_(pkt.from, TOPIC_TEL_TEMP), val);
+                }
+                if (em.has_relative_humidity) {
+                    snprintf(val, sizeof(val), "%.1f", em.relative_humidity);
+                    publish_(node_topic_(pkt.from, TOPIC_TEL_HUMIDITY), val);
+                }
             }
             break;
         }
@@ -574,6 +582,9 @@ int MeshtasticBLEComponent::on_gap_event_(struct ble_gap_event *event, void *arg
             if (event->connect.status == 0) {
                 ESP_LOGI(TAG, "BLE connected (conn_handle=%d)", event->connect.conn_handle);
                 self->conn_handle_ = event->connect.conn_handle;
+                // Request a larger ATT MTU (default is 23 bytes, Meshtastic packets
+                // can be up to ~256 bytes).  The result arrives via BLE_GAP_EVENT_MTU.
+                ble_gattc_exchange_mtu(event->connect.conn_handle, nullptr, nullptr);
                 self->discover_services_();
             } else {
                 ESP_LOGW(TAG, "BLE connect failed (status=%d)", event->connect.status);
@@ -586,6 +597,16 @@ int MeshtasticBLEComponent::on_gap_event_(struct ble_gap_event *event, void *arg
             self->conn_handle_ = BLE_HS_CONN_HANDLE_NONE;
             self->state_ = GatewayState::IDLE;
             self->config_complete_ = false;
+            // Reset discovered GATT handles so a reconnect rediscovers them.
+            self->svc_start_handle_    = 0;
+            self->svc_end_handle_      = 0;
+            self->toradio_handle_      = 0;
+            self->fromradio_handle_    = 0;
+            self->fromnum_handle_      = 0;
+            self->fromnum_cccd_handle_ = 0;
+            // Clear drain flags to prevent stale reads on the next connection.
+            self->pending_fromradio_read_ = false;
+            self->read_in_flight_         = false;
             self->publish_availability_(false);
             break;
 
@@ -766,14 +787,14 @@ void MeshtasticBLEComponent::send_text_message_(const std::string &text) {
     meshtastic_ToRadio to_radio = meshtastic_ToRadio_init_zero;
     to_radio.which_payload_variant = meshtastic_ToRadio_packet_tag;
 
-    meshtastic_MeshPacket &pkt = to_radio.payload_variant.packet;
+    meshtastic_MeshPacket &pkt = to_radio.packet;
     pkt.to       = UINT32_MAX;   // 0xFFFFFFFF = broadcast
     pkt.from     = my_node_num_;
     pkt.id       = static_cast<uint32_t>(millis());  // simple monotonic ID
     pkt.want_ack = false;
     pkt.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
 
-    meshtastic_Data &d = pkt.payload_variant.decoded;
+    meshtastic_Data &d = pkt.decoded;
     d.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
 
     // Copy text into the fixed nanopb bytes array (max 233 bytes per proto options).

@@ -16,8 +16,8 @@
  * fromRadio — read-only: returns one ToRadio protobuf per read.  Keep reading
  *             until the response is empty (0 bytes).
  *
- * toRadio  — write-only (write-without-response): client writes a FromRadio
- *            protobuf here to send a packet into the mesh.
+ * toRadio  — write: client writes a ToRadio protobuf here to send a packet
+ *            into the mesh.
  *
  * All three characteristics live under a single service.
  */
